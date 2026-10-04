@@ -1,68 +1,82 @@
-// Staro relay server - zero dependencies (Node 18+).
+// Staro relay server - zero dependencies (Node 18+).  PRIVATE-ROOM edition.
 //
-//   OWNER_KEY=xxxx MEMBER_KEY=yyyy node server.js
+//   node server.js
 //
-// OWNER_KEY  : required. Used by the Owner's remote GUI and by the stands.
-// MEMBER_KEY : optional. For members' remote GUI. Commands sent with it are
-//              tagged role="member"; the stand refuses to let them act as the Owner.
-// PORT       : default 8787 (hosting platforms set this automatically).
+// No OWNER_KEY / MEMBER_KEY any more. The ROOM NAME is the password:
+// every user makes their own long random room name (16-64 characters) and puts
+// the same one in the script on their main account and on their stand account.
+// Nobody can read or command a room without knowing its exact name.
+//
+// PORT : default 8787 (hosting platforms like Render set this automatically).
 //
 // Endpoints
-//   POST /send   {room, key, sender, cmd}                 -> {ok:true, id}
-//   GET  /poll?room=..&key=..&after=<id>[&wait=<seconds>] -> {epoch, latest, lp, commands:[...]}
-//        With wait>0 the request is HELD (long-poll) until a command arrives or
-//        the time runs out. This keeps the number of requests tiny (a few per
-//        minute instead of ~170) and delivers commands faster.
-//   GET  /                                                -> "ok"
+//   POST /send   {room, sender, cmd}                     -> {ok:true, id}
+//   GET  /poll?after=<id>[&wait=<seconds>]   header  X-Room: <room>
+//                                                         -> {epoch, latest, lp, commands:[...]}
+//        (the room may also be given as ?room=... for old clients)
+//        With wait>0 the request is HELD (long-poll) until a command arrives
+//        or the time runs out.
+//   GET  /                                               -> "ok"
 
 const http = require("http");
-const crypto = require("crypto");
 
 const PORT = process.env.PORT || 8787;
-const OWNER_KEY = process.env.OWNER_KEY || "";
-const MEMBER_KEY = process.env.MEMBER_KEY || "";
-if (!OWNER_KEY) {
-  console.error("Set OWNER_KEY first, e.g.  OWNER_KEY=mysecret node server.js");
-  process.exit(1);
-}
 
-const EPOCH = Date.now().toString(); // changes on restart so stands can resync
 const MAX_BODY = 4096;
 const MAX_CMD_LEN = 200;
-const KEEP_MS = 60_000;
-const KEEP_MAX = 100;
+const KEEP_MS = 60_000;          // commands live this long
+const KEEP_MAX = 100;            // max commands kept per room
 const MAX_WAIT_S = 25;
 const MAX_WAITERS_PER_ROOM = 20;
+const MAX_WAITERS_TOTAL = 1500;  // total held (long-poll) connections on the whole server
+const MAX_ROOMS = 5000;
+const ROOM_IDLE_MS = 10 * 60_000; // a room nobody touched for this long is deleted
+const SWEEP_MS = 60_000;
 
-const rooms = new Map();   // room -> { seq, cmds: [{id, t, sender, cmd, role}] }
-const waiters = new Map(); // room -> Set of { res, after, timer }
-const hits = new Map();    // ip -> [timestamps] (send rate limit)
+const ROOM_RE = /^[A-Za-z0-9._-]{16,64}$/; // too-short (guessable) rooms are refused
 
-const sha = (s) => crypto.createHash("sha256").update(String(s)).digest();
-const same = (a, b) => b !== "" && crypto.timingSafeEqual(sha(a), sha(b));
+const rooms = new Map();    // room -> { seq, epoch, seen, cmds: [{id, t, sender, cmd}] }
+const waiters = new Map();  // room -> Set of { res, after, timer }
+let waiterTotal = 0;
 
-function roleOf(key) {
-  if (same(key, OWNER_KEY)) return "owner";
-  if (MEMBER_KEY && same(key, MEMBER_KEY)) return "member";
-  return null;
-}
+// rate limit buckets: key -> [timestamps]
+const bucketSendIp = new Map();
+const bucketSendRoom = new Map();
+const bucketPollIp = new Map();
+const bucketNewRoomIp = new Map();
 
-function getRoom(name) {
-  let r = rooms.get(name);
-  if (!r) {
-    if (rooms.size >= 200) return null; // don't let anyone create unlimited rooms
-    r = { seq: 0, cmds: [] };
-    rooms.set(name, r);
-  }
-  return r;
-}
-
-function limited(ip) {
+function hit(bucket, key, windowMs, max) {
   const now = Date.now();
-  const list = (hits.get(ip) || []).filter((t) => now - t < 10_000);
+  const list = (bucket.get(key) || []).filter((t) => now - t < windowMs);
   list.push(now);
-  hits.set(ip, list);
-  return list.length > 40; // max 40 sends / 10 s per IP
+  bucket.set(key, list);
+  return list.length > max; // true = over the limit
+}
+
+function sweepBucket(bucket, windowMs) {
+  const now = Date.now();
+  for (const [k, list] of bucket) {
+    if (!list.length || now - list[list.length - 1] > windowMs) bucket.delete(k);
+  }
+}
+
+function newEpoch() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+// Returns the room, creating it if needed. null = refused (too many rooms).
+function getRoom(name, ip) {
+  let r = rooms.get(name);
+  if (r) {
+    r.seen = Date.now();
+    return r;
+  }
+  if (rooms.size >= MAX_ROOMS) return null;
+  if (hit(bucketNewRoomIp, ip, 60_000, 30)) return null; // max 30 new rooms / min / IP
+  // each room has its OWN epoch: if a room is deleted and re-created, stands resync
+  r = { seq: 0, epoch: newEpoch(), seen: Date.now(), cmds: [] };
+  rooms.set(name, r);
+  return r;
 }
 
 function json(res, code, obj) {
@@ -72,19 +86,20 @@ function json(res, code, obj) {
   res.end(body);
 }
 
-const validRoom = (s) => typeof s === "string" && /^[\w.-]{1,40}$/.test(s);
-
 function pollPayload(r, after) {
   const now = Date.now();
   r.cmds = r.cmds.filter((c) => now - c.t < KEEP_MS);
   const commands = Number.isFinite(after) && after >= 0
-    ? r.cmds.filter((c) => c.id > after).map(({ id, sender, cmd, role }) => ({ id, sender, cmd, role }))
+    ? r.cmds.filter((c) => c.id > after).map(({ id, sender, cmd }) => ({ id, sender, cmd, role: "owner" }))
     : [];
-  return { epoch: EPOCH, latest: r.seq, lp: true, commands };
+  return { epoch: r.epoch, latest: r.seq, lp: true, commands };
 }
 
 function dropWaiter(room, w) {
+  if (w.dropped) return;
+  w.dropped = true;
   clearTimeout(w.timer);
+  waiterTotal = Math.max(0, waiterTotal - 1);
   const set = waiters.get(room);
   if (set) {
     set.delete(w);
@@ -105,6 +120,18 @@ function wake(room) {
   }
 }
 
+// periodic cleanup: idle rooms + old rate-limit entries (keeps memory flat)
+setInterval(() => {
+  const now = Date.now();
+  for (const [name, r] of rooms) {
+    if (!waiters.has(name) && now - r.seen > ROOM_IDLE_MS) rooms.delete(name);
+  }
+  sweepBucket(bucketSendIp, 10_000);
+  sweepBucket(bucketSendRoom, 10_000);
+  sweepBucket(bucketPollIp, 10_000);
+  sweepBucket(bucketNewRoomIp, 60_000);
+}, SWEEP_MS).unref();
+
 const server = http.createServer((req, res) => {
   const ip = (req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").toString().split(",")[0].trim();
   const url = new URL(req.url, "http://localhost");
@@ -115,11 +142,10 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === "GET" && url.pathname === "/poll") {
-    const room = url.searchParams.get("room");
-    const role = roleOf(url.searchParams.get("key") || "");
-    if (!role) return json(res, 401, { error: "bad key" });
-    if (!validRoom(room)) return json(res, 400, { error: "bad room" });
-    const r = getRoom(room);
+    if (hit(bucketPollIp, ip, 10_000, 100)) return json(res, 429, { error: "slow down" });
+    const room = String(req.headers["x-room"] || url.searchParams.get("room") || "");
+    if (!ROOM_RE.test(room)) return json(res, 400, { error: "bad room (use 16-64 letters/numbers/-_.)" });
+    const r = getRoom(room, ip);
     if (!r) return json(res, 429, { error: "too many rooms" });
     const after = parseInt(url.searchParams.get("after"), 10);
     const wait = Math.min(Math.max(parseInt(url.searchParams.get("wait"), 10) || 0, 0), MAX_WAIT_S);
@@ -127,47 +153,59 @@ const server = http.createServer((req, res) => {
     const payload = pollPayload(r, after);
     const canHold = wait > 0 && Number.isFinite(after) && after >= 0;
     const set = waiters.get(room);
-    if (payload.commands.length > 0 || !canHold || (set && set.size >= MAX_WAITERS_PER_ROOM)) {
+    if (payload.commands.length > 0 || !canHold
+        || (set && set.size >= MAX_WAITERS_PER_ROOM) || waiterTotal >= MAX_WAITERS_TOTAL) {
       return json(res, 200, payload);
     }
 
     // long-poll: hold until a command arrives or the time is up
-    const w = { res, after, timer: null };
+    const w = { res, after, timer: null, dropped: false };
     w.timer = setTimeout(() => {
       dropWaiter(room, w);
+      r.seen = Date.now();
       json(res, 200, pollPayload(r, after));
     }, wait * 1000);
     if (!waiters.has(room)) waiters.set(room, new Set());
     waiters.get(room).add(w);
+    waiterTotal++;
     res.on("close", () => dropWaiter(room, w));
     return;
   }
 
   if (req.method === "POST" && url.pathname === "/send") {
-    if (limited(ip)) return json(res, 429, { error: "slow down" });
+    if (hit(bucketSendIp, ip, 10_000, 40)) return json(res, 429, { error: "slow down" });
     let size = 0;
+    let tooBig = false;
     const chunks = [];
     req.on("data", (c) => {
+      if (tooBig) return;
       size += c.length;
-      if (size > MAX_BODY) { req.destroy(); return; }
+      if (size > MAX_BODY) {
+        tooBig = true;
+        json(res, 413, { error: "too big" });
+        req.destroy();
+        return;
+      }
       chunks.push(c);
     });
     req.on("end", () => {
+      if (tooBig) return;
       let b;
       try { b = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { return json(res, 400, { error: "bad json" }); }
-      const role = roleOf(String(b.key || ""));
-      if (!role) return json(res, 401, { error: "bad key" });
-      if (!validRoom(b.room)) return json(res, 400, { error: "bad room" });
+      if (!b || typeof b !== "object") return json(res, 400, { error: "bad json" });
+      const room = String(b.room || "");
+      if (!ROOM_RE.test(room)) return json(res, 400, { error: "bad room (use 16-64 letters/numbers/-_.)" });
+      if (hit(bucketSendRoom, room, 10_000, 30)) return json(res, 429, { error: "slow down" }); // can't be dodged by faking the IP
       const sender = String(b.sender || "").slice(0, 40);
       const cmd = String(b.cmd || "").trim();
       if (!sender || !cmd || cmd.length > MAX_CMD_LEN) return json(res, 400, { error: "bad command" });
-      const r = getRoom(b.room);
+      const r = getRoom(room, ip);
       if (!r) return json(res, 429, { error: "too many rooms" });
       const id = ++r.seq;
-      r.cmds.push({ id, t: Date.now(), sender, cmd, role });
+      r.cmds.push({ id, t: Date.now(), sender, cmd });
       if (r.cmds.length > KEEP_MAX) r.cmds.splice(0, r.cmds.length - KEEP_MAX);
       json(res, 200, { ok: true, id });
-      wake(b.room);
+      wake(room);
     });
     return;
   }
@@ -175,4 +213,4 @@ const server = http.createServer((req, res) => {
   json(res, 404, { error: "not found" });
 });
 
-server.listen(PORT, () => console.log(`Staro relay listening on :${PORT}`));
+server.listen(PORT, () => console.log(`Staro relay (private rooms) listening on :${PORT}`));
